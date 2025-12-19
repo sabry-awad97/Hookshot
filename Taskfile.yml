@@ -73,6 +73,12 @@ tasks:
       - echo "🏥 Checking Bun server..."
       - curl -s http://localhost:4000/health
 
+  test:go:
+    desc: Run Go unit tests
+    dir: "{{.GO_SERVER_DIR}}"
+    cmds:
+      - go test ./... -v
+
   test:trigger:
     desc: Trigger default webhook
     cmds:

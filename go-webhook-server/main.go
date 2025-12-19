@@ -1,83 +1,57 @@
 package main
 
 import (
-	"encoding/json"
-	"io"
 	"log"
 	"net/http"
-	"time"
+	"os"
+
+	"hookshot-server/pkg/webhook"
 
 	"github.com/gin-gonic/gin"
-	svix "github.com/svix/svix-webhooks/go"
 )
 
-// WebhookPayload represents the data sent to subscribers
-type WebhookPayload struct {
-	Event     string    `json:"event"`
-	Timestamp time.Time `json:"timestamp"`
-	Data      any       `json:"data"`
-}
-
-const webhookSecret = "whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw"
-
 func main() {
-	r := gin.Default()
+	// Get configuration from environment (with defaults)
+	secret := getEnv("WEBHOOK_SECRET", "whsec_C2FtcGxlX3NlY3JldF9rZXlfZm9yX3Rlc3Rpbmc=")
+	targetURL := getEnv("WEBHOOK_TARGET_URL", "http://localhost:4000/webhook")
 
-	// Initialize Svix webhook sender
-	wh, err := svix.NewWebhook(webhookSecret)
+	// Create reusable webhook client
+	client, err := webhook.NewClient(webhook.Config{
+		TargetURL:  targetURL,
+		Secret:     secret,
+		MaxRetries: 3,
+	})
 	if err != nil {
-		log.Fatalf("Failed to initialize Svix webhook: %v", err)
+		log.Fatalf("Failed to create webhook client: %v", err)
 	}
 
-	// Health check endpoint
+	r := gin.Default()
+
+	// Health check
 	r.GET("/health", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	})
 
-	// Trigger webhook endpoint
+	// Trigger default webhook
 	r.POST("/trigger", func(c *gin.Context) {
-		payload := []byte(`{"event":"order.created","timestamp":"` + time.Now().Format(time.RFC3339) + `","data":{"order_id":"12345","amount":99.99}}`)
+		resp := client.Send("order.created", map[string]any{
+			"order_id": "12345",
+			"amount":   99.99,
+		})
 
-		// Generate Svix signature headers
-		msgID := "msg_" + time.Now().Format("20060102150405")
-		timestamp := time.Now()
-		signature, err := wh.Sign(msgID, timestamp, payload)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		if !resp.Success {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": resp.Error.Error()})
 			return
 		}
-
-		// Send webhook to listener
-		client := &http.Client{Timeout: 10 * time.Second}
-		req, _ := http.NewRequest("POST", "http://localhost:4000/webhook", nil)
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("svix-id", msgID)
-		req.Header.Set("svix-timestamp", timestamp.Format(time.RFC3339))
-		req.Header.Set("svix-signature", signature)
-
-		// Use bytes.NewBuffer for body
-		req, _ = http.NewRequest("POST", "http://localhost:4000/webhook",
-			&payloadReader{payload: payload})
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("svix-id", msgID)
-		req.Header.Set("svix-timestamp", timestamp.Format(time.RFC3339))
-		req.Header.Set("svix-signature", signature)
-
-		resp, err := client.Do(req)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-			return
-		}
-		defer resp.Body.Close()
 
 		c.JSON(http.StatusOK, gin.H{
 			"message":   "Webhook sent!",
-			"msgId":     msgID,
-			"signature": signature,
+			"msgId":     resp.MessageID,
+			"signature": resp.Signature,
 		})
 	})
 
-	// Custom trigger with event type
+	// Trigger custom event
 	r.POST("/trigger/:event", func(c *gin.Context) {
 		event := c.Param("event")
 
@@ -87,58 +61,28 @@ func main() {
 			return
 		}
 
-		payload := WebhookPayload{
-			Event:     event,
-			Timestamp: time.Now(),
-			Data:      data,
-		}
+		resp := client.Send(event, data)
 
-		payloadBytes, _ := json.Marshal(payload)
-		msgID := "msg_" + time.Now().Format("20060102150405")
-		timestamp := time.Now()
-		signature, err := wh.Sign(msgID, timestamp, payloadBytes)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		if !resp.Success {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": resp.Error.Error()})
 			return
 		}
-
-		client := &http.Client{Timeout: 10 * time.Second}
-		req, _ := http.NewRequest("POST", "http://localhost:4000/webhook",
-			&payloadReader{payload: payloadBytes})
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("svix-id", msgID)
-		req.Header.Set("svix-timestamp", timestamp.Format(time.RFC3339))
-		req.Header.Set("svix-signature", signature)
-
-		resp, err := client.Do(req)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-			return
-		}
-		defer resp.Body.Close()
 
 		c.JSON(http.StatusOK, gin.H{
 			"message": "Webhook sent!",
 			"event":   event,
-			"msgId":   msgID,
+			"msgId":   resp.MessageID,
 		})
 	})
 
-	log.Println("🚀 Gin + Svix webhook server running on :8080")
-	r.Run(":8080")
+	port := getEnv("PORT", "8080")
+	log.Printf("🚀 Gin + Webhook server running on :%s", port)
+	r.Run(":" + port)
 }
 
-// payloadReader implements io.Reader for sending payload
-type payloadReader struct {
-	payload []byte
-	offset  int
-}
-
-func (r *payloadReader) Read(p []byte) (n int, err error) {
-	if r.offset >= len(r.payload) {
-		return 0, io.EOF
+func getEnv(key, fallback string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
 	}
-	n = copy(p, r.payload[r.offset:])
-	r.offset += n
-	return n, nil
+	return fallback
 }
