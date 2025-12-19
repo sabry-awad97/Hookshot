@@ -9,6 +9,8 @@ import (
 	"log"
 	"net/http"
 	"time"
+
+	"github.com/gin-gonic/gin"
 )
 
 // WebhookPayload represents the data sent to subscribers
@@ -24,6 +26,13 @@ type WebhookConfig struct {
 	Secret string
 }
 
+// generateSignature creates HMAC-SHA256 signature
+func generateSignature(payload []byte, secret string) string {
+	h := hmac.New(sha256.New, []byte(secret))
+	h.Write(payload)
+	return hex.EncodeToString(h.Sum(nil))
+}
+
 // SendWebhook sends a signed webhook to a subscriber
 func SendWebhook(config WebhookConfig, payload WebhookPayload) error {
 	jsonData, err := json.Marshal(payload)
@@ -31,7 +40,6 @@ func SendWebhook(config WebhookConfig, payload WebhookPayload) error {
 		return err
 	}
 
-	// Create HMAC signature for security
 	signature := generateSignature(jsonData, config.Secret)
 
 	req, err := http.NewRequest("POST", config.URL, bytes.NewBuffer(jsonData))
@@ -56,16 +64,32 @@ func SendWebhook(config WebhookConfig, payload WebhookPayload) error {
 	return nil
 }
 
-// generateSignature creates HMAC-SHA256 signature
-func generateSignature(payload []byte, secret string) string {
-	h := hmac.New(sha256.New, []byte(secret))
-	h.Write(payload)
-	return hex.EncodeToString(h.Sum(nil))
+// SendWebhookWithRetry sends webhook with exponential backoff
+func SendWebhookWithRetry(config WebhookConfig, payload WebhookPayload, maxRetries int) error {
+	var lastErr error
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if err := SendWebhook(config, payload); err == nil {
+			return nil
+		} else {
+			lastErr = err
+			backoff := time.Duration(1<<attempt) * time.Second
+			log.Printf("Retry %d/%d in %v: %v", attempt+1, maxRetries, backoff, err)
+			time.Sleep(backoff)
+		}
+	}
+	return lastErr
 }
 
 func main() {
-	// HTTP server that triggers webhooks
-	http.HandleFunc("/trigger", func(w http.ResponseWriter, r *http.Request) {
+	r := gin.Default()
+
+	// Health check endpoint
+	r.GET("/health", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+	})
+
+	// Trigger webhook endpoint
+	r.POST("/trigger", func(c *gin.Context) {
 		config := WebhookConfig{
 			URL:    "http://localhost:4000/webhook",
 			Secret: "your-shared-secret-key",
@@ -80,15 +104,43 @@ func main() {
 			},
 		}
 
-		if err := SendWebhook(config, payload); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+		if err := SendWebhookWithRetry(config, payload, 3); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
 
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("Webhook sent!"))
+		c.JSON(http.StatusOK, gin.H{"message": "Webhook sent!"})
 	})
 
-	log.Println("Go server running on :8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	// Custom trigger with payload from request body
+	r.POST("/trigger/:event", func(c *gin.Context) {
+		event := c.Param("event")
+
+		var data map[string]any
+		if err := c.ShouldBindJSON(&data); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid JSON payload"})
+			return
+		}
+
+		config := WebhookConfig{
+			URL:    "http://localhost:4000/webhook",
+			Secret: "your-shared-secret-key",
+		}
+
+		payload := WebhookPayload{
+			Event:     event,
+			Timestamp: time.Now(),
+			Data:      data,
+		}
+
+		if err := SendWebhookWithRetry(config, payload, 3); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+
+		c.JSON(http.StatusOK, gin.H{"message": "Webhook sent!", "event": event})
+	})
+
+	log.Println("🚀 Gin webhook server running on :8080")
+	r.Run(":8080")
 }
