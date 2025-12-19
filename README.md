@@ -17,8 +17,11 @@ A cross-language webhook system with **reusable libraries** for Go and Bun/TypeS
 - ✅ **Reusable Libraries** - Drop-in packages for any project
 - ✅ **Svix SDK** - Industry-standard webhook signatures
 - ✅ **Environment Configuration** - No hardcoded secrets
-- ✅ **Retry with Backoff** - Automatic exponential retry
-- ✅ **Event Registration** - Fluent handler API
+- ✅ **Retry with Backoff** - Exponential retry with jitter (5xx only)
+- ✅ **Context Support** - Go context for cancellation/timeouts
+- ✅ **Type-Safe Events** - TypeScript generics for event payloads
+- ✅ **Parallel Handlers** - Optional concurrent event processing
+- ✅ **Error Resilience** - Handler errors don't break the chain
 - ✅ **Comprehensive Tests** - Go and Bun test suites
 
 ## Quick Start
@@ -50,7 +53,10 @@ task test
 ### Go: `pkg/webhook`
 
 ```go
-import "hookshot-server/pkg/webhook"
+import (
+    "context"
+    "hookshot-server/pkg/webhook"
+)
 
 client, _ := webhook.NewClient(webhook.Config{
     TargetURL:  "https://example.com/webhook",
@@ -58,22 +64,35 @@ client, _ := webhook.NewClient(webhook.Config{
     MaxRetries: 3,
 })
 
-resp := client.Send("order.created", map[string]any{
+ctx := context.Background()
+resp := client.Send(ctx, "order.created", map[string]any{
     "id": "123",
 })
+
+if resp.Success {
+    fmt.Printf("Sent: %s (status: %d)\n", resp.MessageID, resp.StatusCode)
+}
 ```
 
 ### Bun: `lib/webhook`
 
 ```typescript
-import { WebhookHandler } from "./lib/webhook";
+import { createWebhookHandler, type BaseEventMap } from "./lib/webhook";
 
-const webhook = new WebhookHandler({
+// Type-safe event definitions
+interface MyEvents extends BaseEventMap {
+  "order.created": { orderId: string; amount: number };
+  "user.signup": { userId: string; email: string };
+}
+
+const webhook = createWebhookHandler<MyEvents>({
   secret: process.env.WEBHOOK_SECRET!,
+  parallelExecution: true,
+  onHandlerError: (err, event) => console.error(`${event} failed:`, err),
 });
 
 webhook
-  .on("order.created", (data) => console.log(data))
+  .on("order.created", (data) => console.log(data.orderId)) // typed!
   .onAll((data, payload) => console.log(payload.event));
 
 app.post("/webhook", webhook.handler());

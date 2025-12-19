@@ -7,8 +7,10 @@ import type { Context } from "hono";
 export interface WebhookConfig {
   /** Svix signing secret (whsec_...) */
   secret: string;
-  /** Timestamp tolerance in ms (default: 5 minutes) */
-  timestampTolerance?: number;
+  /** Whether to run handlers in parallel (default: false) */
+  parallelExecution?: boolean;
+  /** Error handler for failed event handlers */
+  onHandlerError?: (error: unknown, event: string) => void;
 }
 
 /**
@@ -29,13 +31,28 @@ export type EventHandler<T = unknown> = (
 ) => void | Promise<void>;
 
 /**
+ * Base event map constraint - use specific interfaces for type-safe events
+ */
+// eslint-disable-next-line @typescript-eslint/no-empty-object-type
+export interface BaseEventMap {}
+
+/**
+ * Resolved config with defaults applied
+ */
+interface ResolvedConfig {
+  secret: string;
+  parallelExecution: boolean;
+  onHandlerError: (error: unknown, event: string) => void;
+}
+
+/**
  * Reusable webhook handler with Svix verification
  */
-export class WebhookHandler {
+export class WebhookHandler<TEventMap extends BaseEventMap = BaseEventMap> {
   private svix: Webhook;
   private handlers: Map<string, EventHandler[]> = new Map();
   private wildcardHandlers: EventHandler[] = [];
-  private config: Required<WebhookConfig>;
+  private config: ResolvedConfig;
 
   constructor(config: WebhookConfig) {
     if (!config.secret) {
@@ -44,7 +61,8 @@ export class WebhookHandler {
 
     this.config = {
       secret: config.secret,
-      timestampTolerance: config.timestampTolerance ?? 5 * 60 * 1000,
+      parallelExecution: config.parallelExecution ?? false,
+      onHandlerError: config.onHandlerError ?? (() => {}),
     };
 
     this.svix = new Webhook(this.config.secret);
@@ -53,13 +71,27 @@ export class WebhookHandler {
   /**
    * Register an event handler
    */
-  on<T = unknown>(event: string, handler: EventHandler<T>): this {
-    if (event === "*") {
-      this.wildcardHandlers.push(handler as EventHandler);
-    } else {
-      const handlers = this.handlers.get(event) ?? [];
-      handlers.push(handler as EventHandler);
-      this.handlers.set(event, handlers);
+  on<K extends keyof TEventMap & string>(
+    event: K,
+    handler: EventHandler<TEventMap[K]>
+  ): this {
+    const handlers = this.handlers.get(event) ?? [];
+    handlers.push(handler as EventHandler);
+    this.handlers.set(event, handlers);
+    return this;
+  }
+
+  /**
+   * Unregister an event handler
+   */
+  off<K extends keyof TEventMap & string>(
+    event: K,
+    handler: EventHandler<TEventMap[K]>
+  ): this {
+    const handlers = this.handlers.get(event);
+    if (handlers) {
+      const idx = handlers.indexOf(handler as EventHandler);
+      if (idx > -1) handlers.splice(idx, 1);
     }
     return this;
   }
@@ -68,7 +100,17 @@ export class WebhookHandler {
    * Register handler for all events
    */
   onAll<T = unknown>(handler: EventHandler<T>): this {
-    return this.on("*", handler);
+    this.wildcardHandlers.push(handler as EventHandler);
+    return this;
+  }
+
+  /**
+   * Unregister a wildcard handler
+   */
+  offAll<T = unknown>(handler: EventHandler<T>): this {
+    const idx = this.wildcardHandlers.indexOf(handler as EventHandler);
+    if (idx > -1) this.wildcardHandlers.splice(idx, 1);
+    return this;
   }
 
   /**
@@ -76,9 +118,10 @@ export class WebhookHandler {
    */
   handler() {
     return async (c: Context) => {
-      const svixId = c.req.header("svix-id");
-      const svixTimestamp = c.req.header("svix-timestamp");
-      const svixSignature = c.req.header("svix-signature");
+      const headers = c.req.raw.headers;
+      const svixId = this.getHeader(headers, "svix-id");
+      const svixTimestamp = this.getHeader(headers, "svix-timestamp");
+      const svixSignature = this.getHeader(headers, "svix-signature");
 
       // Validate headers
       if (!svixId || !svixTimestamp || !svixSignature) {
@@ -115,21 +158,51 @@ export class WebhookHandler {
    * Standalone verify method for custom usage
    */
   verify(body: string, headers: Record<string, string>): WebhookPayload {
-    return this.svix.verify(body, headers) as WebhookPayload;
+    const normalized = this.normalizeHeaders(headers);
+    return this.svix.verify(body, normalized) as WebhookPayload;
+  }
+
+  /**
+   * Get header value case-insensitively
+   */
+  private getHeader(headers: Headers, name: string): string | null {
+    return headers.get(name);
+  }
+
+  /**
+   * Normalize header keys to lowercase
+   */
+  private normalizeHeaders(
+    headers: Record<string, string>
+  ): Record<string, string> {
+    const normalized: Record<string, string> = {};
+    for (const [key, value] of Object.entries(headers)) {
+      normalized[key.toLowerCase()] = value;
+    }
+    return normalized;
   }
 
   private async executeHandlers(payload: WebhookPayload): Promise<void> {
     const { event, data } = payload;
-
-    // Execute specific handlers
     const handlers = this.handlers.get(event) ?? [];
-    for (const handler of handlers) {
-      await handler(data, payload);
-    }
+    const allHandlers = [...handlers, ...this.wildcardHandlers];
 
-    // Execute wildcard handlers
-    for (const handler of this.wildcardHandlers) {
-      await handler(data, payload);
+    if (this.config.parallelExecution) {
+      await Promise.allSettled(
+        allHandlers.map((handler) =>
+          Promise.resolve(handler(data, payload)).catch((err) =>
+            this.config.onHandlerError(err, event)
+          )
+        )
+      );
+    } else {
+      for (const handler of allHandlers) {
+        try {
+          await handler(data, payload);
+        } catch (err) {
+          this.config.onHandlerError(err, event);
+        }
+      }
     }
   }
 }
@@ -137,6 +210,8 @@ export class WebhookHandler {
 /**
  * Create a webhook handler (factory function)
  */
-export function createWebhookHandler(config: WebhookConfig): WebhookHandler {
-  return new WebhookHandler(config);
+export function createWebhookHandler<
+  TEventMap extends BaseEventMap = BaseEventMap
+>(config: WebhookConfig): WebhookHandler<TEventMap> {
+  return new WebhookHandler<TEventMap>(config);
 }

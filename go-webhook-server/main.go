@@ -16,11 +16,9 @@ func main() {
 	targetURL := getEnv("WEBHOOK_TARGET_URL", "http://localhost:4000/webhook")
 
 	// Create reusable webhook client
-	client, err := webhook.NewClient(webhook.Config{
-		TargetURL:  targetURL,
-		Secret:     secret,
-		MaxRetries: 3,
-	})
+	client, err := webhook.NewClient(targetURL, secret,
+		webhook.WithMaxRetries(3),
+	)
 	if err != nil {
 		log.Fatalf("Failed to create webhook client: %v", err)
 	}
@@ -34,7 +32,7 @@ func main() {
 
 	// Trigger default webhook
 	r.POST("/trigger", func(c *gin.Context) {
-		resp := client.Send("order.created", map[string]any{
+		resp := client.Send(c.Request.Context(), "order.created", map[string]any{
 			"order_id": "12345",
 			"amount":   99.99,
 		})
@@ -45,9 +43,8 @@ func main() {
 		}
 
 		c.JSON(http.StatusOK, gin.H{
-			"message":   "Webhook sent!",
-			"msgId":     resp.MessageID,
-			"signature": resp.Signature,
+			"message": "Webhook sent!",
+			"msgId":   resp.MessageID,
 		})
 	})
 
@@ -61,7 +58,7 @@ func main() {
 			return
 		}
 
-		resp := client.Send(event, data)
+		resp := client.Send(c.Request.Context(), event, data)
 
 		if !resp.Success {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": resp.Error.Error()})
