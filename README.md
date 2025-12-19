@@ -55,14 +55,16 @@ task test
 ```go
 import (
     "context"
+    "os"
     "hookshot-server/pkg/webhook"
 )
 
-client, _ := webhook.NewClient(webhook.Config{
-    TargetURL:  "https://example.com/webhook",
-    Secret:     os.Getenv("WEBHOOK_SECRET"),
-    MaxRetries: 3,
-})
+client, _ := webhook.NewClient(
+    "https://example.com/webhook",
+    os.Getenv("WEBHOOK_SECRET"),
+    webhook.WithMaxRetries(3),
+    webhook.WithTimeout(10 * time.Second),
+)
 
 ctx := context.Background()
 resp := client.Send(ctx, "order.created", map[string]any{

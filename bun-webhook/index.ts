@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { logger } from "hono/logger";
 import { secureHeaders } from "hono/secure-headers";
-import { WebhookHandler } from "./lib/webhook";
+import { WebhookHandler, type BaseEventMap } from "./lib/webhook";
 
 const app = new Hono();
 
@@ -11,8 +11,15 @@ const WEBHOOK_SECRET =
   process.env.WEBHOOK_SECRET ??
   "whsec_C2FtcGxlX3NlY3JldF9rZXlfZm9yX3Rlc3Rpbmc=";
 
-// Create reusable webhook handler
-const webhook = new WebhookHandler({ secret: WEBHOOK_SECRET });
+// Define type-safe event map
+interface AppEvents extends BaseEventMap {
+  "order.created": { order_id: string; amount: number };
+  "order.updated": { order_id: string; status: string };
+  "payment.received": { transaction_id: string; amount: number };
+}
+
+// Create reusable webhook handler with typed events
+const webhook = new WebhookHandler<AppEvents>({ secret: WEBHOOK_SECRET });
 
 // Register event handlers
 webhook
