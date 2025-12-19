@@ -1,16 +1,14 @@
 package main
 
 import (
-	"bytes"
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
+	"io"
 	"log"
 	"net/http"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	svix "github.com/svix/svix-webhooks/go"
 )
 
 // WebhookPayload represents the data sent to subscribers
@@ -20,68 +18,16 @@ type WebhookPayload struct {
 	Data      any       `json:"data"`
 }
 
-// WebhookConfig holds subscriber configuration
-type WebhookConfig struct {
-	URL    string
-	Secret string
-}
-
-// generateSignature creates HMAC-SHA256 signature
-func generateSignature(payload []byte, secret string) string {
-	h := hmac.New(sha256.New, []byte(secret))
-	h.Write(payload)
-	return hex.EncodeToString(h.Sum(nil))
-}
-
-// SendWebhook sends a signed webhook to a subscriber
-func SendWebhook(config WebhookConfig, payload WebhookPayload) error {
-	jsonData, err := json.Marshal(payload)
-	if err != nil {
-		return err
-	}
-
-	signature := generateSignature(jsonData, config.Secret)
-
-	req, err := http.NewRequest("POST", config.URL, bytes.NewBuffer(jsonData))
-	if err != nil {
-		return err
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Webhook-Signature", signature)
-	req.Header.Set("X-Webhook-Timestamp", time.Now().UTC().Format(time.RFC3339))
-
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 400 {
-		log.Printf("Webhook failed with status: %d", resp.StatusCode)
-	}
-	return nil
-}
-
-// SendWebhookWithRetry sends webhook with exponential backoff
-func SendWebhookWithRetry(config WebhookConfig, payload WebhookPayload, maxRetries int) error {
-	var lastErr error
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		if err := SendWebhook(config, payload); err == nil {
-			return nil
-		} else {
-			lastErr = err
-			backoff := time.Duration(1<<attempt) * time.Second
-			log.Printf("Retry %d/%d in %v: %v", attempt+1, maxRetries, backoff, err)
-			time.Sleep(backoff)
-		}
-	}
-	return lastErr
-}
+const webhookSecret = "whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw"
 
 func main() {
 	r := gin.Default()
+
+	// Initialize Svix webhook sender
+	wh, err := svix.NewWebhook(webhookSecret)
+	if err != nil {
+		log.Fatalf("Failed to initialize Svix webhook: %v", err)
+	}
 
 	// Health check endpoint
 	r.GET("/health", func(c *gin.Context) {
@@ -90,29 +36,48 @@ func main() {
 
 	// Trigger webhook endpoint
 	r.POST("/trigger", func(c *gin.Context) {
-		config := WebhookConfig{
-			URL:    "http://localhost:4000/webhook",
-			Secret: "your-shared-secret-key",
-		}
+		payload := []byte(`{"event":"order.created","timestamp":"` + time.Now().Format(time.RFC3339) + `","data":{"order_id":"12345","amount":99.99}}`)
 
-		payload := WebhookPayload{
-			Event:     "order.created",
-			Timestamp: time.Now(),
-			Data: map[string]any{
-				"order_id": "12345",
-				"amount":   99.99,
-			},
-		}
-
-		if err := SendWebhookWithRetry(config, payload, 3); err != nil {
+		// Generate Svix signature headers
+		msgID := "msg_" + time.Now().Format("20060102150405")
+		timestamp := time.Now()
+		signature, err := wh.Sign(msgID, timestamp, payload)
+		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
 
-		c.JSON(http.StatusOK, gin.H{"message": "Webhook sent!"})
+		// Send webhook to listener
+		client := &http.Client{Timeout: 10 * time.Second}
+		req, _ := http.NewRequest("POST", "http://localhost:4000/webhook", nil)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("svix-id", msgID)
+		req.Header.Set("svix-timestamp", timestamp.Format(time.RFC3339))
+		req.Header.Set("svix-signature", signature)
+
+		// Use bytes.NewBuffer for body
+		req, _ = http.NewRequest("POST", "http://localhost:4000/webhook",
+			&payloadReader{payload: payload})
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("svix-id", msgID)
+		req.Header.Set("svix-timestamp", timestamp.Format(time.RFC3339))
+		req.Header.Set("svix-signature", signature)
+
+		resp, err := client.Do(req)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		defer resp.Body.Close()
+
+		c.JSON(http.StatusOK, gin.H{
+			"message":   "Webhook sent!",
+			"msgId":     msgID,
+			"signature": signature,
+		})
 	})
 
-	// Custom trigger with payload from request body
+	// Custom trigger with event type
 	r.POST("/trigger/:event", func(c *gin.Context) {
 		event := c.Param("event")
 
@@ -122,25 +87,58 @@ func main() {
 			return
 		}
 
-		config := WebhookConfig{
-			URL:    "http://localhost:4000/webhook",
-			Secret: "your-shared-secret-key",
-		}
-
 		payload := WebhookPayload{
 			Event:     event,
 			Timestamp: time.Now(),
 			Data:      data,
 		}
 
-		if err := SendWebhookWithRetry(config, payload, 3); err != nil {
+		payloadBytes, _ := json.Marshal(payload)
+		msgID := "msg_" + time.Now().Format("20060102150405")
+		timestamp := time.Now()
+		signature, err := wh.Sign(msgID, timestamp, payloadBytes)
+		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
 
-		c.JSON(http.StatusOK, gin.H{"message": "Webhook sent!", "event": event})
+		client := &http.Client{Timeout: 10 * time.Second}
+		req, _ := http.NewRequest("POST", "http://localhost:4000/webhook",
+			&payloadReader{payload: payloadBytes})
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("svix-id", msgID)
+		req.Header.Set("svix-timestamp", timestamp.Format(time.RFC3339))
+		req.Header.Set("svix-signature", signature)
+
+		resp, err := client.Do(req)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		defer resp.Body.Close()
+
+		c.JSON(http.StatusOK, gin.H{
+			"message": "Webhook sent!",
+			"event":   event,
+			"msgId":   msgID,
+		})
 	})
 
-	log.Println("🚀 Gin webhook server running on :8080")
+	log.Println("🚀 Gin + Svix webhook server running on :8080")
 	r.Run(":8080")
+}
+
+// payloadReader implements io.Reader for sending payload
+type payloadReader struct {
+	payload []byte
+	offset  int
+}
+
+func (r *payloadReader) Read(p []byte) (n int, err error) {
+	if r.offset >= len(r.payload) {
+		return 0, io.EOF
+	}
+	n = copy(p, r.payload[r.offset:])
+	r.offset += n
+	return n, nil
 }

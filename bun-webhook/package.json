@@ -10,6 +10,7 @@
     "typescript": "^5"
   },
   "dependencies": {
-    "hono": "^4.11.1"
+    "hono": "^4.11.1",
+    "svix": "^1.82.0"
   }
 }

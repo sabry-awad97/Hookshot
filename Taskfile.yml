@@ -1,0 +1,93 @@
+version: "3"
+
+vars:
+  GO_SERVER_DIR: ./go-webhook-server
+  BUN_SERVER_DIR: ./bun-webhook
+
+tasks:
+  default:
+    desc: Show available tasks
+    cmds:
+      - task --list
+
+  # Installation
+  install:
+    desc: Install all dependencies
+    deps: [install:go, install:bun]
+
+  install:go:
+    desc: Install Go dependencies
+    dir: "{{.GO_SERVER_DIR}}"
+    cmds:
+      - go mod tidy
+
+  install:bun:
+    desc: Install Bun dependencies
+    dir: "{{.BUN_SERVER_DIR}}"
+    cmds:
+      - bun install
+
+  # Development servers
+  dev:
+    desc: Start both servers (use separate terminals)
+    cmds:
+      - echo "Run 'task dev:bun' and 'task dev:go' in separate terminals"
+
+  dev:go:
+    desc: Start Go webhook sender
+    dir: "{{.GO_SERVER_DIR}}"
+    cmds:
+      - go run main.go
+
+  dev:bun:
+    desc: Start Bun webhook listener
+    dir: "{{.BUN_SERVER_DIR}}"
+    cmds:
+      - bun run index.ts
+
+  # Build
+  build:
+    desc: Build all services
+    deps: [build:go]
+
+  build:go:
+    desc: Build Go server
+    dir: "{{.GO_SERVER_DIR}}"
+    cmds:
+      - go build -o server.exe .
+
+  # Testing
+  test:
+    desc: Test webhook endpoints
+    cmds:
+      - task: test:health
+      - task: test:trigger
+      - task: test:custom
+
+  test:health:
+    desc: Check health endpoints
+    cmds:
+      - echo "🏥 Checking Go server..."
+      - curl -s http://localhost:8080/health
+      - echo ""
+      - echo "🏥 Checking Bun server..."
+      - curl -s http://localhost:4000/health
+
+  test:trigger:
+    desc: Trigger default webhook
+    cmds:
+      - echo "🚀 Triggering order.created..."
+      - curl -s -X POST http://localhost:8080/trigger
+
+  test:custom:
+    desc: Trigger custom event
+    cmds:
+      - echo "💰 Triggering payment.received..."
+      - 'curl -s -X POST http://localhost:8080/trigger/payment.received -H "Content-Type: application/json" -d "{\"transaction_id\": \"TXN-001\", \"amount\": 150.00}"'
+
+  # Utilities
+  clean:
+    desc: Clean build artifacts
+    cmds:
+      - cmd: del /q {{.GO_SERVER_DIR}}\server.exe
+        ignore_error: true

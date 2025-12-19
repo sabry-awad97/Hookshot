@@ -1,32 +1,18 @@
 import { Hono } from "hono";
 import { logger } from "hono/logger";
 import { secureHeaders } from "hono/secure-headers";
-import { createHmac, timingSafeEqual } from "crypto";
+import { Webhook } from "svix";
 
 const app = new Hono();
-const SECRET = "your-shared-secret-key";
 const PORT = 4000;
+
+// Must match the secret used in Go server
+const WEBHOOK_SECRET = "whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw";
 
 interface WebhookPayload {
   event: string;
   timestamp: string;
   data: Record<string, unknown>;
-}
-
-// Verify HMAC signature
-function verifySignature(payload: string, signature: string): boolean {
-  const expectedSignature = createHmac("sha256", SECRET)
-    .update(payload)
-    .digest("hex");
-
-  try {
-    return timingSafeEqual(
-      Buffer.from(signature),
-      Buffer.from(expectedSignature)
-    );
-  } catch {
-    return false;
-  }
 }
 
 // Event handlers registry
@@ -51,35 +37,32 @@ app.get("/health", (c) => {
   return c.json({ status: "ok" });
 });
 
-// Webhook endpoint
+// Webhook endpoint with Svix verification
 app.post("/webhook", async (c) => {
-  const signature = c.req.header("X-Webhook-Signature");
-  const timestamp = c.req.header("X-Webhook-Timestamp");
+  const svixId = c.req.header("svix-id");
+  const svixTimestamp = c.req.header("svix-timestamp");
+  const svixSignature = c.req.header("svix-signature");
 
-  // Validate required headers
-  if (!signature || !timestamp) {
-    return c.json({ error: "Missing signature or timestamp" }, 401);
+  // Validate required Svix headers
+  if (!svixId || !svixTimestamp || !svixSignature) {
+    console.log("❌ Missing Svix headers");
+    return c.json({ error: "Missing Svix headers" }, 401);
   }
 
-  // Check timestamp freshness (prevent replay attacks - 5 min window)
-  const webhookTime = new Date(timestamp).getTime();
-  const now = Date.now();
-  if (Math.abs(now - webhookTime) > 5 * 60 * 1000) {
-    return c.json({ error: "Webhook timestamp too old" }, 401);
-  }
-
-  // Get raw body for signature verification
   const rawBody = await c.req.text();
 
-  // Verify HMAC signature
-  if (!verifySignature(rawBody, signature)) {
-    return c.json({ error: "Invalid signature" }, 401);
-  }
+  // Verify webhook using Svix SDK
+  const wh = new Webhook(WEBHOOK_SECRET);
 
-  // Parse and process payload
   try {
-    const payload: WebhookPayload = JSON.parse(rawBody);
-    console.log(`\n🔔 Received webhook: ${payload.event}`);
+    // Svix verify handles signature validation and timestamp checking
+    const payload = wh.verify(rawBody, {
+      "svix-id": svixId,
+      "svix-timestamp": svixTimestamp,
+      "svix-signature": svixSignature,
+    }) as WebhookPayload;
+
+    console.log(`\n🔔 Verified webhook: ${payload.event} (ID: ${svixId})`);
 
     // Route to appropriate handler
     const handler = eventHandlers[payload.event];
@@ -89,10 +72,14 @@ app.post("/webhook", async (c) => {
       console.log(`⚠️ Unknown event type: ${payload.event}`);
     }
 
-    return c.json({ message: "Webhook received", event: payload.event });
+    return c.json({
+      message: "Webhook verified and processed",
+      event: payload.event,
+      msgId: svixId,
+    });
   } catch (error) {
-    console.error("Failed to parse webhook:", error);
-    return c.json({ error: "Invalid JSON payload" }, 400);
+    console.error("❌ Webhook verification failed:", error);
+    return c.json({ error: "Invalid webhook signature" }, 401);
   }
 });
 
@@ -112,4 +99,6 @@ export default {
   fetch: app.fetch,
 };
 
-console.log(`🚀 Hono webhook server running on http://localhost:${PORT}`);
+console.log(
+  `🚀 Hono + Svix webhook server running on http://localhost:${PORT}`
+);
